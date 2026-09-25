@@ -114,7 +114,7 @@ def main():
     return
 "
         );
-        compile(&parse(&src).expect("parse")).execute([F192::ZERO; 2]);
+        compile(&parse(&src).expect("parse")).execute([F192::ZERO; 2]).unwrap();
     }
     // `s = [s[1], s[0]]` rebinds to a fresh run and must still swap.
     let swap = "\
@@ -132,7 +132,7 @@ def main():
         F192::from(primitives::field::F64(7)),
         F192::from(primitives::field::F64(5)),
     ];
-    compile(&parse(swap).expect("parse")).execute(want);
+    compile(&parse(swap).expect("parse")).execute(want).unwrap();
 }
 
 /// A `mul_range` stop bound that is a compile-time value but not a power of GEN
@@ -261,7 +261,7 @@ fn one_hinted_value_needs_no_buffer() {
         let want = [g_pow(5).into(), g_pow(0).into()];
         let (proof, _) = prove(&program, want, lean_vm::pcs::TEST_LOG_INV_RATE).unwrap();
         verify(&program, &want, &proof).expect("verifies");
-        program.execute(want).base_counts.iter().sum::<usize>()
+        program.execute(want).unwrap().base_counts.iter().sum::<usize>()
     };
     assert_eq!(run(&old), run(&new), "the sugar must cost what it replaces");
 
@@ -633,10 +633,7 @@ fn a_value_may_ask_for_the_integer_regime() {
             "def main():\n    for i in unroll(3, 4):\n        v = {expr}\n        assert v == {want}\n    return\n"
         );
         let program = compile(&parse(&src).expect("parse"));
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            program.execute([F192::ZERO, F192::ZERO]);
-        }))
-        .is_ok()
+        program.execute([F192::ZERO, F192::ZERO]).is_ok()
     };
 
     // i = 3: the integer reading is 4, the field reading `3 XOR 1` is 2.
@@ -881,7 +878,7 @@ def main():
     assert sa[0] == GEN
     return
 ";
-    let exec = compile(&parse(src).expect("parse")).execute([F192::ZERO; 2]);
+    let exec = compile(&parse(src).expect("parse")).execute([F192::ZERO; 2]).unwrap();
     assert!(exec.unconstrained_reads.is_empty(), "no prover-chosen read");
 }
 
@@ -904,7 +901,7 @@ def main():
     assert hb[1] == GEN
     return
 ";
-    let exec = compile(&parse(src).expect("parse")).execute([F192::ZERO; 2]);
+    let exec = compile(&parse(src).expect("parse")).execute([F192::ZERO; 2]).unwrap();
     assert!(exec.unconstrained_reads.is_empty(), "no prover-chosen read");
 }
 
@@ -996,15 +993,8 @@ fn a_failed_assert_names_its_source_line() {
     // 1 blank, 2 def, 3 let, 4 blank, 5 the assert that cannot hold.
     let src = "\ndef main():\n    x = GEN ** 3\n\n    assert x == GEN ** 4\n    return\n";
     let program = compile(&parse(src).expect("parse"));
-    let err = std::panic::catch_unwind(|| {
-        program.execute([F192::ZERO; 2]);
-    })
-    .expect_err("the assert cannot hold");
-    let msg = err
-        .downcast_ref::<String>()
-        .cloned()
-        .unwrap_or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()).unwrap_or_default());
-    assert!(msg.contains("line 5"), "{msg}");
+    let err = program.execute([F192::ZERO; 2]).err().expect("the assert cannot hold");
+    assert!(err.site.contains("line 5"), "{err}");
 }
 
 /// An `@inline` body lowers through the CALLER's `FnLower`, so its statements
@@ -1016,15 +1006,11 @@ fn an_inline_call_does_not_steal_the_call_site_line() {
     // 1 blank, 2 @inline, 3 def, 4 let, 5 return, 6-7 blank, 8 def main, ... 12 the assert.
     let src = "\n@inline\ndef idf(x):\n    y = x * x\n    return y\n\n\ndef main():\n    hb = HeapBuf(4)\n    hb[GEN] = GEN ** 3\n    a = hb[GEN]\n    assert idf(a) == GEN\n    return\n";
     let program = compile(&parse(src).expect("parse"));
-    let err = std::panic::catch_unwind(|| {
-        program.execute([F192::ZERO; 2]);
-    })
-    .expect_err("the assert cannot hold");
-    let msg = err
-        .downcast_ref::<String>()
-        .cloned()
-        .unwrap_or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()).unwrap_or_default());
-    assert!(msg.contains("line 12"), "the call site, not the callee's line 5: {msg}");
+    let err = program.execute([F192::ZERO; 2]).err().expect("the assert cannot hold");
+    assert!(
+        err.site.contains("line 12"),
+        "the call site, not the callee's line 5: {err}"
+    );
 }
 
 /// The fill blocks are not source code, so they carry the unknown line rather

@@ -76,16 +76,9 @@ def main():
     let run = |den: F64| -> bool {
         let mut program = compile(&parse(src).expect("parse"));
         program.set_witness("den", vec![vec![F192::from(den)]]);
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let (proof, _) = prove(
-                &program,
-                [F192::from(F64::ONE), F192::from(F64::ONE)],
-                lean_vm::pcs::TEST_LOG_INV_RATE,
-            )
-            .unwrap();
-            verify(&program, &[F192::from(F64::ONE), F192::from(F64::ONE)], &proof).is_ok()
-        }))
-        .unwrap_or(false)
+        let pi = [F192::from(F64::ONE), F192::from(F64::ONE)];
+        prove(&program, pi, lean_vm::pcs::TEST_LOG_INV_RATE)
+            .is_ok_and(|(proof, _)| verify(&program, &pi, &proof).is_ok())
     };
     assert!(run(g_pow(4)), "nonzero divisor must verify");
     assert!(!run(F64::ZERO), "zero divisor must be rejected");

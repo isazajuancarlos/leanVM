@@ -506,8 +506,9 @@ pub enum AggregationError {
     /// compiled with. Small aggregates are padded up to the floor, so this means
     /// a child too big: more signatures than one node can hold.
     ChildOutOfRange { log_committed: usize },
-    /// The prover made no proof of this node (for instance its witness is larger
-    /// than any verifier accepts: too many signatures for one proof).
+    /// The prover made no proof of this node: the guest rejects its input (a
+    /// forged signature fails the guest's run), or its witness is larger than any
+    /// verifier accepts (too many signatures for one proof).
     ProofError(ProveError),
 }
 
@@ -3427,13 +3428,18 @@ def main():
                         .map(|k| F192::from(F64(((offset >> k) & 1) as u64)))
                         .collect();
                     let expected = primitives::multilinear::eq_eval(&selector, &point[kappa..mu]);
-                    assert!(run(&point, offset, kappa, expected).unconstrained_reads.is_empty());
+                    assert!(
+                        run(&point, offset, kappa, expected)
+                            .unwrap()
+                            .unconstrained_reads
+                            .is_empty()
+                    );
                     if kappa != 0 {
-                        assert!(std::panic::catch_unwind(|| run(&point, offset + 1, kappa, expected)).is_err());
+                        assert!(run(&point, offset + 1, kappa, expected).is_err());
                     }
                 }
             }
-            assert!(std::panic::catch_unwind(|| run(&point, 1usize << MU_MAX, 0, F192::ZERO)).is_err());
+            assert!(run(&point, 1usize << MU_MAX, 0, F192::ZERO).is_err());
         }
     }
 
@@ -3492,6 +3498,7 @@ def main():
                 .collect();
             assert!(
                 run(index, tree[8 + index], &pairs, tree[1])
+                    .unwrap()
                     .unconstrained_reads
                     .is_empty()
             );
@@ -3500,7 +3507,7 @@ def main():
                     for byte in [0, 16] {
                         let mut forged = pairs.clone();
                         forged[level][side][byte] ^= 1;
-                        assert!(std::panic::catch_unwind(|| run(index, tree[8 + index], &forged, tree[1])).is_err());
+                        assert!(run(index, tree[8 + index], &forged, tree[1]).is_err());
                     }
                 }
                 // Rehash a forged running child all the way to a matching public root.
@@ -3513,10 +3520,10 @@ def main():
                         pair[(index >> height) & 1] = root;
                         root = pcs::merkle::hash_pair(&pair[0], &pair[1]);
                     }
-                    assert!(std::panic::catch_unwind(|| run(index, tree[8 + index], &forged, root)).is_err());
+                    assert!(run(index, tree[8 + index], &forged, root).is_err());
                 }
             }
-            assert!(std::panic::catch_unwind(|| run(index ^ 1, tree[8 + index], &pairs, tree[1])).is_err());
+            assert!(run(index ^ 1, tree[8 + index], &pairs, tree[1]).is_err());
         }
     }
 
@@ -3789,114 +3796,101 @@ def main():
         // The first child's omitted root occupies slot 1; it cannot cover slot 0
         // (the second child's declared root) or write outside the DA region.
         for index in [count(0), count(2), count(MAX_KEYS - 1), F192::ZERO, F192::new(0, 1, 0)] {
-            let outcome = std::panic::catch_unwind(|| {
-                aggregate_tampered(
-                    &children,
-                    vec![],
-                    vec![],
-                    None,
-                    DaInput {
-                        rows: &[],
-                        roots: Some(&[second]),
-                    },
-                    LOG_INV_RATE,
-                    |h| {
-                        h.entries("da_index")[0] = vec![index];
-                    },
-                )
-            });
-            assert!(!matches!(outcome, Ok(Ok(_))), "accepted false DA slot {index:?}");
-        }
-        let outcome = std::panic::catch_unwind(|| {
-            aggregate_tampered(
-                &[children[0].clone(), children[0].clone()],
+            let outcome = aggregate_tampered(
+                &children,
                 vec![],
                 vec![],
                 None,
-                DaInput::default(),
+                DaInput {
+                    rows: &[],
+                    roots: Some(&[second]),
+                },
                 LOG_INV_RATE,
                 |h| {
-                    h.entries("da_index")[1] = h.entries("da_index")[0].clone();
+                    h.entries("da_index")[0] = vec![index];
                 },
-            )
-        });
+            );
+            assert!(outcome.is_err(), "accepted false DA slot {index:?}");
+        }
+        let outcome = aggregate_tampered(
+            &[children[0].clone(), children[0].clone()],
+            vec![],
+            vec![],
+            None,
+            DaInput::default(),
+            LOG_INV_RATE,
+            |h| {
+                h.entries("da_index")[1] = h.entries("da_index")[0].clone();
+            },
+        );
         assert!(
-            !matches!(outcome, Ok(Ok(_))),
+            outcome.is_err(),
             "identical roots still require distinct coverage writes"
         );
         // An extra, unclaimed slot leaves the published digest and both child
         // statements intact; only the final coverage count rejects it.
         for (declared, duplicates) in [(1, 2), (MAX_DA_ROOTS + 1, 1), (1, MAX_RECURSIONS * MAX_DA_ROOTS + 2)] {
-            let outcome = std::panic::catch_unwind(|| {
-                aggregate_tampered(
-                    &children,
-                    vec![],
-                    vec![],
-                    None,
-                    DaInput {
-                        rows: &[],
-                        roots: Some(&[second]),
-                    },
-                    LOG_INV_RATE,
-                    |h| {
-                        h.entries("da_meta")[0] = vec![count(declared), count(duplicates)];
-                        h.entries("da_roots").push(da_claim_cells(&second));
-                    },
-                )
-            });
-            assert!(!matches!(outcome, Ok(Ok(_))), "accepted invalid DA coverage shape");
+            let outcome = aggregate_tampered(
+                &children,
+                vec![],
+                vec![],
+                None,
+                DaInput {
+                    rows: &[],
+                    roots: Some(&[second]),
+                },
+                LOG_INV_RATE,
+                |h| {
+                    h.entries("da_meta")[0] = vec![count(declared), count(duplicates)];
+                    h.entries("da_roots").push(da_claim_cells(&second));
+                },
+            );
+            assert!(outcome.is_err(), "accepted invalid DA coverage shape");
         }
         for selected in [None, Some([].as_slice()), Some([second].as_slice())] {
-            let outcome = std::panic::catch_unwind(|| {
-                aggregate_tampered(
-                    &children,
-                    vec![],
-                    vec![],
-                    None,
-                    DaInput {
-                        rows: &[],
-                        roots: selected,
-                    },
-                    LOG_INV_RATE,
-                    |h| {
-                        let root = h
-                            .entries("da_roots")
-                            .iter_mut()
-                            .find(|r| **r == da_claim_cells(&second))
-                            .unwrap();
-                        *root = da_claim_cells(&first);
-                    },
-                )
-            });
-            assert!(
-                !matches!(outcome, Ok(Ok(_))),
-                "every child's complete DA list must be authenticated"
+            let outcome = aggregate_tampered(
+                &children,
+                vec![],
+                vec![],
+                None,
+                DaInput {
+                    rows: &[],
+                    roots: selected,
+                },
+                LOG_INV_RATE,
+                |h| {
+                    let root = h
+                        .entries("da_roots")
+                        .iter_mut()
+                        .find(|r| **r == da_claim_cells(&second))
+                        .unwrap();
+                    *root = da_claim_cells(&first);
+                },
             );
+            assert!(outcome.is_err(), "every child's complete DA list must be authenticated");
         }
         for limb in [2, 3] {
-            let outcome = std::panic::catch_unwind(|| {
-                aggregate_tampered(
-                    &children,
-                    vec![],
-                    vec![],
-                    None,
-                    DaInput {
-                        rows: &[],
-                        roots: Some(&[second]),
-                    },
-                    LOG_INV_RATE,
-                    |h| {
-                        let omitted = h
-                            .entries("da_roots")
-                            .iter_mut()
-                            .find(|claim| claim[..2] == pack_hash_state(&first))
-                            .unwrap();
-                        omitted[limb] += F192::ONE;
-                    },
-                )
-            });
+            let outcome = aggregate_tampered(
+                &children,
+                vec![],
+                vec![],
+                None,
+                DaInput {
+                    rows: &[],
+                    roots: Some(&[second]),
+                },
+                LOG_INV_RATE,
+                |h| {
+                    let omitted = h
+                        .entries("da_roots")
+                        .iter_mut()
+                        .find(|claim| claim[..2] == pack_hash_state(&first))
+                        .unwrap();
+                    omitted[limb] += F192::ONE;
+                },
+            );
             assert!(
-                !matches!(outcome, Ok(Ok(_))),
+                outcome.is_err(),
                 "a child's vector hash cannot change, even for an omitted root"
             );
         }
@@ -3995,10 +3989,10 @@ def main():
             hints.install(&mut program);
             let public = pack_hash_state(&da_list_digest(&roots));
             if n <= MAX_DA_ROOTS {
-                let execution = program.execute(public);
+                let execution = program.execute(public).unwrap();
                 assert!(execution.unconstrained_reads.is_empty(), "{n} roots");
             } else {
-                assert!(std::panic::catch_unwind(|| program.execute(public)).is_err());
+                assert!(program.execute(public).is_err());
             }
         }
     }
@@ -4049,8 +4043,8 @@ def main():
             hints.install(&mut program);
             program.execute(pack_hash_state(&da_list_digest(&[claimed])))
         };
-        assert!(run(2, count(0), first).unconstrained_reads.is_empty());
-        assert!(run(2, count(1), second).unconstrained_reads.is_empty());
+        assert!(run(2, count(0), first).unwrap().unconstrained_reads.is_empty());
+        assert!(run(2, count(1), second).unwrap().unconstrained_reads.is_empty());
         // Matching public roots must not bypass the region bound, even when the
         // out-of-range root is present in memory.
         for (slots, index, claimed) in [
@@ -4060,7 +4054,7 @@ def main():
             (2, F192::ZERO, first),
             (2, F192::new(0, 1, 0), first),
         ] {
-            assert!(std::panic::catch_unwind(|| run(slots, index, claimed)).is_err());
+            assert!(run(slots, index, claimed).is_err());
         }
     }
 
@@ -4106,26 +4100,26 @@ def main():
             hints.install(&mut program);
             program.execute(public)
         };
-        let honest = run(&codewords, &|_, _| {});
+        let honest = run(&codewords, &|_, _| {}).unwrap();
         assert!(honest.unconstrained_reads.is_empty());
 
         // Every vector is orthogonal to zero rows: only hashing can reject these changes.
         let zeros = vec![0; codewords.len()];
         for limb in [F192::ONE, F192::new(0, 1, 0), F192::new(0, 0, 1)] {
             assert!(
-                std::panic::catch_unwind(|| run(&zeros, &|h, _| {
+                run(&zeros, &|h, _| {
                     h.entries("da_weights")[0][0] += limb;
-                }))
+                })
                 .is_err(),
                 "every limb of L must be bound by its hash"
             );
         }
         assert!(
-            std::panic::catch_unwind(|| run(&zeros, &|h, _| {
+            run(&zeros, &|h, _| {
                 for block in h.entries("da_weights") {
                     block.fill(F192::ZERO);
                 }
-            }))
+            })
             .is_err(),
             "zero weights must not bypass the external vector hash"
         );
@@ -4141,7 +4135,7 @@ def main():
         ] {
             let mut bad = codewords.clone();
             bad[position] ^= 1;
-            assert!(std::panic::catch_unwind(|| run(&bad, &|_, _| {})).is_err());
+            assert!(run(&bad, &|_, _| {}).is_err());
         }
         // A zero vector with its own hash passes the guest even for bad data.
         // The verifier must derive the expected hash from the root, never trust this hash.
@@ -4157,17 +4151,17 @@ def main():
             }
             *public = pack_hash_state(&forged_digest);
         });
-        assert!(unchecked.unconstrained_reads.is_empty());
+        assert!(unchecked.unwrap().unconstrained_reads.is_empty());
         assert!(
-            std::panic::catch_unwind(|| run(&codewords, &|_, public| {
+            run(&codewords, &|_, public| {
                 public[0] += F192::ONE;
-            }))
+            })
             .is_err()
         );
         assert!(
-            std::panic::catch_unwind(|| run(&codewords, &|h, _| {
+            run(&codewords, &|h, _| {
                 h.entries("da_symbols")[0][0] += F192::new(0, 1, 0);
-            }))
+            })
             .is_err()
         );
         // Give the inflated tree its own matching root, so rejection must come
@@ -4176,25 +4170,25 @@ def main():
         padded_words.resize(8 * CODEWORD_SYMBOLS, 0);
         let (padded_commitment, _) = lean_da::commit_codewords(padded_words);
         assert!(
-            std::panic::catch_unwind(|| run(&codewords, &|h, public| {
+            run(&codewords, &|h, public| {
                 h.entries("da_shape")[0][1] = count(3);
                 *public = pack_hash_state(&da_list_digest(&[padded_commitment.root]));
-            }))
+            })
             .is_err(),
             "three rows must not use an eight-row tree, even with a matching root"
         );
         assert!(
-            std::panic::catch_unwind(|| run(&zeros, &|h, _| {
+            run(&zeros, &|h, _| {
                 h.entries("da_shape")[0][0] = count(0);
-            }))
+            })
             .is_err(),
             "an empty payload with a matching zero-padded root must be rejected"
         );
         for (rows, log_pad) in [(DA_MAX_ROWS + 1, 10), (3, 1), (3, DA_MAX_ROWS.ilog2() as usize + 1)] {
             assert!(
-                std::panic::catch_unwind(|| run(&codewords, &|h, _| {
+                run(&codewords, &|h, _| {
                     h.entries("da_shape")[0] = vec![count(rows), count(log_pad)];
-                }))
+                })
                 .is_err(),
                 "accepted shape ({rows}, {log_pad})"
             );
@@ -4221,7 +4215,7 @@ def main():
         counts.dedup();
         for rows in counts {
             for depth in 0..=max_depth + 1 {
-                let result = std::panic::catch_unwind(|| guest.execute([count(rows), count(depth)]));
+                let result = guest.execute([count(rows), count(depth)]);
                 let valid = (1..=DA_MAX_ROWS).contains(&rows) && rows.next_power_of_two() == 1 << depth;
                 assert_eq!(result.is_ok(), valid, "rows={rows}, depth={depth}");
                 if let Ok(execution) = result {
@@ -4231,7 +4225,7 @@ def main():
         }
         for bad in [F192::ZERO, F192::new(0, 1, 0), count(1).inv()] {
             for public in [[bad, count(0)], [count(1), bad]] {
-                assert!(std::panic::catch_unwind(|| guest.execute(public)).is_err());
+                assert!(guest.execute(public).is_err());
             }
         }
     }
@@ -4262,7 +4256,7 @@ def main():
                         vec![(0..8).map(|j| F192::from(F64(((value >> j) & 1) as u64))).collect()],
                     );
                     program.set_witness("ceil_log", vec![vec![count(depth)]]);
-                    let result = std::panic::catch_unwind(|| program.execute([count(value), count(depth)]));
+                    let result = program.execute([count(value), count(depth)]);
                     assert_eq!(
                         result.is_ok(),
                         depth == expected.max(floor),
@@ -4815,22 +4809,17 @@ def main():
                        raw_sphincs: Vec<RawSphincs>,
                        description: &str,
                        tamper: &dyn Fn(&mut Hints)| {
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                aggregate_tampered(
-                    children,
-                    raw_signatures,
-                    raw_sphincs,
-                    None,
-                    DaInput::default(),
-                    LOG_INV_RATE,
-                    |hints| tamper(hints),
-                )
-                .map(|(signature, _)| signature.verify().is_ok())
-            }));
-            assert!(
-                !matches!(outcome, Ok(Ok(true))),
-                "tampering {description} must be rejected"
-            );
+            let outcome = aggregate_tampered(
+                children,
+                raw_signatures,
+                raw_sphincs,
+                None,
+                DaInput::default(),
+                LOG_INV_RATE,
+                |hints| tamper(hints),
+            )
+            .map(|(signature, _)| signature.verify().is_ok());
+            assert!(!matches!(outcome, Ok(true)), "tampering {description} must be rejected");
         };
 
         let raw_signatures = at_epoch(&signers[..SMALL_LEAF_SIZE], XMSS_EPOCH_A);
@@ -5159,22 +5148,16 @@ def main():
         lean_vm::init_prover_pool();
         let mut raw_signatures = at_epoch(&get_signers(3), XMSS_EPOCH_A);
         raw_signatures[1].3.wots_signature.chain_tips[0][0] ^= 1;
-        let built = std::panic::catch_unwind(|| {
-            aggregate(&[], raw_signatures, vec![], &[], None, LOG_INV_RATE).map(|signature| signature.verify().is_ok())
-        });
         assert!(
-            !matches!(built, Ok(Ok(true))),
-            "a forged signature must not produce a verifying aggregate"
+            aggregate(&[], raw_signatures, vec![], &[], None, LOG_INV_RATE).is_err(),
+            "a forged signature must be rejected"
         );
 
         let mut raw_sphincs = get_sphincs_signers(2);
         raw_sphincs[1].2.ots[2][0][0] ^= 1;
-        let built = std::panic::catch_unwind(|| {
-            aggregate(&[], vec![], raw_sphincs, &[], None, LOG_INV_RATE).map(|signature| signature.verify().is_ok())
-        });
         assert!(
-            !matches!(built, Ok(Ok(true))),
-            "a forged SPHINCS signature must not produce a verifying aggregate"
+            aggregate(&[], vec![], raw_sphincs, &[], None, LOG_INV_RATE).is_err(),
+            "a forged SPHINCS signature must be rejected"
         );
     }
 

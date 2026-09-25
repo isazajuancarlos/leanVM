@@ -7,7 +7,7 @@
 //! end-of-run resolution of the two touched cells.
 
 use lean_compiler::{compile, parse};
-use lean_vm::cpu::{prove, verify};
+use lean_vm::cpu::{Fault, prove, verify};
 use primitives::field::{F64, F192, g_pow};
 
 use crate::common::mix;
@@ -113,21 +113,27 @@ def main():
 /// element, and its DEREF fails witness generation: the honest-execution
 /// surface of a failing range check.
 #[test]
-#[should_panic(expected = "failed range check")]
 fn range_check_at_bound_rejected() {
     let src = "def main():\n    x = GEN ** 8\n    assert log x < 8\n    return\n";
     let program = compile(&parse(src).expect("parse"));
-    program.execute([F192::ZERO, F192::ZERO]);
+    let err = program
+        .execute([F192::ZERO, F192::ZERO])
+        .err()
+        .expect("the run must fail");
+    assert!(matches!(err.fault, Fault::WildPointer { .. }), "{err}");
 }
 
 /// A value that is no small g-power at all (5 = x^2 + 1) fails at the first
 /// DEREF, the same way.
 #[test]
-#[should_panic(expected = "failed range check")]
 fn range_check_non_g_power_rejected() {
     let src = "def main():\n    x = 5\n    assert log x < 8\n    return\n";
     let program = compile(&parse(src).expect("parse"));
-    program.execute([F192::ZERO, F192::ZERO]);
+    let err = program
+        .execute([F192::ZERO, F192::ZERO])
+        .err()
+        .expect("the run must fail");
+    assert!(matches!(err.fault, Fault::WildPointer { .. }), "{err}");
 }
 
 /// Bound 0 names the empty set: rejected at compile time.
@@ -187,7 +193,6 @@ def main():
 /// back-solves to a huge-exponent element whose DEREF fails, exactly as for a
 /// compile-time bound at its boundary.
 #[test]
-#[should_panic(expected = "failed range check")]
 fn range_check_runtime_bound_at_bound_rejected() {
     let src = "\
 def main():
@@ -199,7 +204,11 @@ def main():
 ";
     let mut program = compile(&parse(src).expect("parse"));
     program.set_witness("n", vec![vec![F192::from(g_pow(5))]]);
-    program.execute([F192::ZERO, F192::ZERO]);
+    let err = program
+        .execute([F192::ZERO, F192::ZERO])
+        .err()
+        .expect("the run must fail");
+    assert!(matches!(err.fault, Fault::WildPointer { .. }), "{err}");
 }
 
 /// A bound that folds at parse time but is not a power of `GEN` stays a parse

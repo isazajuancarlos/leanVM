@@ -49,7 +49,7 @@ def main():
     for end in [2, 3, 9] {
         let sum = (2..end).fold(F64::ZERO, |sum, i| sum + g_pow(i));
         let public = [F192::from(sum), F192::from(g_pow(end))];
-        assert!(program.execute(public).unconstrained_reads.is_empty());
+        assert!(program.execute(public).unwrap().unconstrained_reads.is_empty());
         if end == 9 {
             let (proof, _) = prove(&program, public, lean_vm::pcs::TEST_LOG_INV_RATE).unwrap();
             verify(&program, &public, &proof).unwrap();
@@ -71,7 +71,7 @@ def main():
     return
 "#;
     let program = compile_without_filler(&parse(source).unwrap());
-    let execution = program.execute([F192::from(F64(7)), F192::ZERO]);
+    let execution = program.execute([F192::from(F64(7)), F192::ZERO]).unwrap();
     assert!(execution.unconstrained_reads.is_empty());
 }
 
@@ -93,6 +93,7 @@ def main():
     assert!(
         program
             .execute([g_pow(65536).into(), g_pow(65537).into()])
+            .unwrap()
             .unconstrained_reads
             .is_empty()
     );
@@ -122,7 +123,7 @@ def main():
     let public = [F192::ZERO, g_pow(2).into()];
     for bound in ["GEN ** 2", "public[GEN]"] {
         let program = compile(&parse(&source.replace("STOP", bound)).unwrap());
-        assert!(program.execute(public).unconstrained_reads.is_empty());
+        assert!(program.execute(public).unwrap().unconstrained_reads.is_empty());
         let (proof, _) = prove(&program, public, lean_vm::pcs::TEST_LOG_INV_RATE).unwrap();
         verify(&program, &public, &proof).unwrap();
     }

@@ -13,6 +13,7 @@ use primitives::{
 fn instruction_counts(source: &str, public_input: [F192; 2]) -> [usize; lean_vm::cpu::Stats::TABLES.len()] {
     compile_without_filler(&parse(source).expect("parse"))
         .execute(public_input)
+        .unwrap()
         .base_counts
 }
 

@@ -28,7 +28,7 @@ pub mod hints;
 mod isa;
 pub mod layout;
 mod trace;
-pub use execute::Execution;
+pub use execute::{ExecError, Execution, Fault};
 pub use isa::{DerefMode, Op};
 pub use layout::*;
 pub(crate) use trace::{Brow, Drow, Jrow, Srow, Trace, Xrow};
@@ -309,10 +309,13 @@ impl Program {
 pub use crate::transcript::Proof;
 
 /// Why [`prove`] produced no proof.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProveError {
     /// `log_inv_rate` is outside the range the WHIR configuration accepts (1, 2, 3 or 4).
     InvalidRate { log_inv_rate: usize },
+    /// The program has no execution on this input and advice: a failed `assert`,
+    /// a wild pointer, advice that does not fit, ...
+    Execution(ExecError),
     /// The committed witness is `2^log_committed` words, outside the
     /// `2^MIN_MU..=2^MAX_MU` every verifier accepts
     WitnessOutOfRange { log_committed: usize },
@@ -322,6 +325,7 @@ impl std::fmt::Display for ProveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidRate { log_inv_rate } => write!(f, "log_inv_rate {log_inv_rate} is not supported"),
+            Self::Execution(e) => write!(f, "{e}"),
             Self::WitnessOutOfRange { log_committed } => write!(
                 f,
                 "the committed witness would be 2^{log_committed} words, outside the verifiable 2^{}..=2^{}",
@@ -547,7 +551,8 @@ pub fn prove(program: &Program, public_input: [F192; 2], log_inv_rate: usize) ->
     // The returned `Proof` is system-allocated (`ps.into_proof()` builds `Vec`s),
     // so it survives the next phase.
     let _phase = zk_alloc::enter_phase();
-    let exec = crate::stage!("Execute program", || program.execute_to_floor(public_input));
+    let exec =
+        crate::stage!("Execute program", || program.execute_to_floor(public_input)).map_err(ProveError::Execution)?;
     // A live value that came from outside the constraint system means the emitted
     // bytecode asserts less than its source asked for, so the proof would be about a
     // weaker statement than the program text. That is a compiler bug and never a
@@ -937,7 +942,7 @@ mod tests {
         let program = blake2s_program(a, b);
 
         let pi = [w(7), w(11)];
-        let exec = program.execute(pi);
+        let exec = program.execute(pi).unwrap();
 
         // The output cells hold the compression of the two inputs under the
         // pi-supplied chaining value (two 128-bit chunks).
@@ -950,14 +955,14 @@ mod tests {
     /// constraint: the full three-limb memory bus makes a request carrying a
     /// literal zero in limb 2 match only such a stored word.
     #[test]
-    #[should_panic(expected = "BLAKE2s m0 cell is not a canonical 128-bit embedding")]
     fn blake2s_requires_zero_third_limb() {
         let mut program = blake2s_program([F64::ZERO; 4], [F64::ZERO; 4]);
         program.prog[0] = Op::Set {
             o: 2,
             k: F192::new(0, 0, 1),
         };
-        let _ = program.execute([w(7), w(11)]);
+        let err = program.execute([w(7), w(11)]).err().expect("the run must fail");
+        assert!(matches!(err.fault, Fault::NotCanonical { operand: "m0", .. }), "{err}");
     }
 
     /// A self-hash `BLAKE2s(h, h)` (the hash-chain step) passes the *same* input
@@ -1003,7 +1008,7 @@ mod tests {
         let program = Program::from_bytecode(prog, 16);
         let pi = [w(3), w(5)];
 
-        let exec = program.execute(pi);
+        let exec = program.execute(pi).unwrap();
         let d = blake2s_compress(h, h, cv_lanes(pi[0], pi[1]), md());
         assert_eq!(exec.mem[4], cell(d[0], d[1]));
         assert_eq!(exec.mem[5], cell(d[2], d[3]));
@@ -1024,7 +1029,7 @@ mod tests {
         ];
         let program = Program::from_bytecode(prog, 5);
         let pi = [w(1), w(2)];
-        let exec = program.execute(pi);
+        let exec = program.execute(pi).unwrap();
         assert_eq!(exec.mem[4], x * y, "MUL computes the E product");
     }
 }

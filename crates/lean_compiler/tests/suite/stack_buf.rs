@@ -341,7 +341,7 @@ def make(v):
 ";
     let program = compile(&parse(src).expect("parse"));
     // Field addition is XOR: 5 ^ (5 ^ 3) == 3.
-    program.execute([F192::from(F64(3)), F192::from(F64(11))]);
+    program.execute([F192::from(F64(3)), F192::from(F64(11))]).unwrap();
 }
 
 /// Tuple returns retain their source-level arity even though a StackBuf member
@@ -361,7 +361,7 @@ def make(v):
     return out, v + 1
 ";
     let program = compile(&parse(src).expect("parse"));
-    program.execute([F192::from(F64(15)), F192::from(F64(8))]);
+    program.execute([F192::from(F64(15)), F192::from(F64(8))]).unwrap();
 }
 
 /// HeapBuf already crosses a normal call as its one-cell pointer. Allocation
@@ -384,7 +384,7 @@ def make():
     return out
 ";
     let program = compile(&parse(src).expect("parse"));
-    program.execute([F192::from(F64(17)), F192::from(F64(23))]);
+    program.execute([F192::from(F64(17)), F192::from(F64(23))]).unwrap();
 }
 
 /// A StackBuf index literal that does not fit `u32` is rejected at compile time,
@@ -503,7 +503,7 @@ def select_pair(flag, a, b):
     return first, second
 ";
     let program = compile(&parse(src).expect("parse"));
-    program.execute([F192::ONE, F192::ZERO]);
+    program.execute([F192::ONE, F192::ZERO]).unwrap();
 }
 
 /// An `@inline` may also alias-return a folded **g-address** among its values:
@@ -689,7 +689,7 @@ def main():
     bad.set_witness("adv", vec![vec![g_pow(13).into(), g_pow(14).into()]]);
     let dishonest = [g_pow(13).into(), g_pow(14).into()];
     assert!(
-        std::panic::catch_unwind(|| bad.execute(dishonest)).is_err(),
+        bad.execute(dishonest).is_err(),
         "the pin must reject a hint it does not match"
     );
 
@@ -712,7 +712,7 @@ def main():
     let program = compile(&parse(two).expect("parse"));
     let want = [g_pow(3).into(), g_pow(0).into()];
     assert!(
-        std::panic::catch_unwind(|| program.execute(want)).is_err(),
+        program.execute(want).is_err(),
         "`s[0] = s[1]` asserts that they are equal"
     );
 }

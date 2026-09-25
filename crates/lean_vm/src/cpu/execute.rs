@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 
+use super::hints::MAX_CELLS;
 use super::*;
 use primitives::{
     field::{F64, F192, mul_by_g},
@@ -33,10 +34,122 @@ pub struct Execution {
     pub(crate) trace: Trace, // rows + final access-count columns, emitted in the same walk
 }
 
+/// Why a run has no execution the interpreter can find: the program, on this public
+/// input and advice, asks for something the machine cannot do.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecError {
+    /// The instruction the run failed at, or whose hints it failed in.
+    pub pc: u32,
+    /// Its function and source line ([`Program::site_at`]).
+    pub site: String,
+    pub fault: Fault,
+}
+
+/// What the run asked for that the machine cannot do.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Fault {
+    /// A second value for a written cell: a failed `assert`, or two writes that
+    /// disagree. `hint` names the hint that wrote it, if one did.
+    Conflict {
+        cell: u32,
+        had: F192,
+        new: F192,
+        hint: Option<&'static str>,
+    },
+    /// A `DEREF` through a word that is no small g-power: a wild pointer, or a failed
+    /// range check.
+    WildPointer { value: F192 },
+    /// A word that has to be in `K` is not: a `JUMP` operand, or one a hint reads.
+    NotInK { what: &'static str, value: F192 },
+    /// A word that has to be an address or a count is not a g-power in its range.
+    NotAGPower { what: &'static str, value: F64 },
+    /// A `BLAKE2s` operand outside the 128-bit embedding.
+    NotCanonical { operand: &'static str, value: F192 },
+    /// A `MUL` asked to solve `a·x = c` for `x` with `a = 0`.
+    BackSolveThroughZero,
+    /// The advice does not fit the program: a witness stream is missing or
+    /// exhausted, or an entry has the wrong length.
+    Witness(String),
+    /// The program allocates past the address space.
+    OutOfMemory,
+    /// The halt `pc` reached in a frame other than `main`'s.
+    HaltOutsideMain { fp: u32 },
+    /// Too many instructions: runaway recursion, or a loop that never ends.
+    StepLimit,
+}
+
+/// The longest run the interpreter executes.
+const MAX_STEPS: usize = 100_000_000;
+
+impl ExecError {
+    /// Located at `pc`; `Program::execute_filled` names the site.
+    fn at(pc: u32, fault: Fault) -> Self {
+        Self {
+            pc,
+            site: String::new(),
+            fault,
+        }
+    }
+}
+
+impl std::fmt::Display for ExecError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} at pc {} (in {})", self.fault, self.pc, self.site)
+    }
+}
+
+impl std::error::Error for ExecError {}
+
+/// A word as its limbs, most significant first.
+fn word(w: F192) -> String {
+    format!("{:x}:{:x}:{:x}", w.c2, w.c1, w.c0)
+}
+
+impl std::fmt::Display for Fault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Conflict { cell, had, new, hint } => {
+                write!(
+                    f,
+                    "write-once conflict at cell {cell}: had {}, new {}",
+                    word(*had),
+                    word(*new)
+                )?;
+                match hint {
+                    Some(hint) => write!(f, " (hint {hint})"),
+                    None => Ok(()),
+                }
+            }
+            Self::WildPointer { value } => write!(
+                f,
+                "DEREF pointer is not a small g-power: a wild pointer, or a failed range check (value {})",
+                word(*value)
+            ),
+            Self::NotInK { what, value } => write!(f, "{what} is not a K-valued word ({})", word(*value)),
+            Self::NotAGPower { what, value } => write!(f, "{what} is not a g-power in range (0x{:016x})", value.0),
+            Self::NotCanonical { operand, value } => write!(
+                f,
+                "BLAKE2s {operand} cell is not a canonical 128-bit embedding: top limb 0x{:016x}",
+                value.c2
+            ),
+            Self::BackSolveThroughZero => write!(f, "cannot back-solve MUL through a zero operand"),
+            Self::Witness(problem) => write!(f, "{problem}"),
+            Self::OutOfMemory => write!(f, "the program allocates past 2^{} cells", MAX_CELLS.ilog2()),
+            Self::HaltOutsideMain { fp } => write!(f, "the halt pc reached in frame {fp}, not main's"),
+            Self::StepLimit => write!(f, "step limit of {MAX_STEPS} exceeded (runaway recursion?)"),
+        }
+    }
+}
+
 /// A memory word interpreted as a K-valued address: valid only when both
 /// extension limbs are zero (every g-power is a K-element).
 fn as_addr(v: F192) -> Option<F64> {
     (v.c1 == 0 && v.c2 == 0).then_some(F64(v.c0))
+}
+
+/// [`as_addr`], or why the word is none.
+fn in_k(what: &'static str, v: F192) -> Result<F64, Fault> {
+    as_addr(v).ok_or(Fault::NotInK { what, value: v })
 }
 
 fn pop_witness<'a>(
@@ -44,35 +157,36 @@ fn pop_witness<'a>(
     positions: &mut HashMap<&'a str, usize>,
     name: &'a str,
     len: u32,
-) -> &'a [F192] {
+) -> Result<&'a [F192], Fault> {
     let entries = witness
         .get(name)
-        .unwrap_or_else(|| panic!("no witness stream `{name}` (Program::set_witness)"));
+        .ok_or_else(|| Fault::Witness(format!("no witness stream `{name}` (Program::set_witness)")))?;
     let position = positions.entry(name).or_default();
-    let entry = entries.get(*position).unwrap_or_else(|| {
-        panic!(
+    let entry = entries.get(*position).ok_or_else(|| {
+        Fault::Witness(format!(
             "witness stream `{name}` exhausted (needs entry {}, has {})",
             *position + 1,
             entries.len()
-        )
-    });
-    assert_eq!(
-        entry.len(),
-        len as usize,
-        "witness `{name}` entry {} holds {} values, the destination {len}",
-        *position,
-        entry.len()
-    );
+        ))
+    })?;
+    if entry.len() != len as usize {
+        return Err(Fault::Witness(format!(
+            "witness `{name}` entry {} holds {} values, the destination {len}",
+            *position,
+            entry.len()
+        )));
+    }
     *position += 1;
-    entry
+    Ok(entry)
 }
 
 impl Program {
     /// Run the program in write-once *fill* mode to produce its [`Execution`]:
-    /// the final memory image and the step count. The public input seeds the
-    /// first two memory cells `m[0], m[1]` (§sec:e2e-pi). Compilation yields the
-    /// `Program`; executing it (here) and proving it are separate later phases.
-    pub fn execute(&self, public_input: [F192; 2]) -> Execution {
+    /// the final memory image and the step count, or why it has none. The public
+    /// input seeds the first two memory cells `m[0], m[1]` (§sec:e2e-pi).
+    /// Compilation yields the `Program`; executing it (here) and proving it are
+    /// separate later phases.
+    pub fn execute(&self, public_input: [F192; 2]) -> Result<Execution, ExecError> {
         self.execute_filled(public_input, super::filler::NO_FLOORS)
     }
 
@@ -87,25 +201,25 @@ impl Program {
     /// executing anything; one re-run then realises it, and the loop only exists
     /// because the fill's own closing jumps and frames feed back into the size.
     /// Runs that already clear the floor (every one of consequence) execute once.
-    pub(crate) fn execute_to_floor(&self, public_input: [F192; 2]) -> Execution {
-        let mut exec = self.execute_filled(public_input, super::filler::NO_FLOORS);
+    pub(crate) fn execute_to_floor(&self, public_input: [F192; 2]) -> Result<Execution, ExecError> {
+        let mut exec = self.execute_filled(public_input, super::filler::NO_FLOORS)?;
         if self.min_log_committed == 0 {
-            return exec;
+            return Ok(exec);
         }
         let mut floors = super::filler::NO_FLOORS;
         for _ in 0..3 {
             if self.committed_log(&exec) >= self.min_log_committed {
-                return exec;
+                return Ok(exec);
             }
             floors[super::filler::PAD_TABLE] = 1 << self.padded_height(&exec);
-            exec = self.execute_filled(public_input, floors);
+            exec = self.execute_filled(public_input, floors)?;
         }
         assert!(
             self.committed_log(&exec) >= self.min_log_committed,
             "no fill reaches the requested 2^{} committed witness",
             self.min_log_committed
         );
-        exec
+        Ok(exec)
     }
 
     /// The smallest height for the padded table that takes this run's committed
@@ -145,7 +259,19 @@ impl Program {
         &self,
         public_input: [F192; 2],
         fill_floors: [usize; crate::tables::N_TABLES],
-    ) -> Execution {
+    ) -> Result<Execution, ExecError> {
+        self.walk(public_input, fill_floors).map_err(|e| ExecError {
+            site: self.site_at(e.pc),
+            ..e
+        })
+    }
+
+    /// [`Self::execute_filled`], its errors located by `pc` alone.
+    fn walk(
+        &self,
+        public_input: [F192; 2],
+        fill_floors: [usize; crate::tables::N_TABLES],
+    ) -> Result<Execution, ExecError> {
         // One interpretation of the program, then the fill. The blocks that bring every
         // table to a power of two are cycles no program code enters (`cpu::filler`), so
         // they run after the chain has halted, by which point the program's own row
@@ -167,7 +293,6 @@ impl Program {
             written: vec![false; n0],
             count: vec![F64::ONE; n0],
             dbg_pc: 0,
-            dbg_line: 0,
             dbg_hint: None,
         };
         // Seed the public input into m[0], m[1] (addresses g^0, g^1, §sec:e2e-pi).
@@ -223,11 +348,11 @@ impl Program {
         let mut blake2s: Vec<Brow> = Vec::new();
 
         // `DEREF Cell` touches whose two sides are both still unwritten (the
-        // range-check gadget's unconstrained target cells), as `(a2, a3)`,
+        // range-check gadget's unconstrained target cells), as `(a2, a3, pc)`,
         // resolved after the run: write-once memory is order-independent, so the
         // value can be decided at the end (leanVM's end-of-execution deref-hint
         // resolution).
-        let mut deferred: Vec<(usize, u32)> = Vec::new();
+        let mut deferred: Vec<(usize, u32, u32)> = Vec::new();
 
         // The three dense per-cell vectors, kept in lockstep. Every method is
         // `#[inline(always)]`: they sit in the interpreter's hot opcode loop.
@@ -236,13 +361,11 @@ impl Program {
             written: Vec<bool>,
             count: Vec<F64>,
             /// The pc of the currently executing instruction, and the name of the
-            /// computed-advice hint if the write comes from one, so the
-            /// write-once panic can report where the conflict happened. Plain
-            /// fields rather than thread-locals: this is written on every step,
-            /// and a thread-local costs a lazy-init check each time.
+            /// computed-advice hint if the write comes from one, so a write-once
+            /// conflict can report where it happened. Plain fields rather than
+            /// thread-locals: this is written on every step, and a thread-local
+            /// costs a lazy-init check each time.
             dbg_pc: u32,
-            /// Source line of that pc, or 0 when the program carries no table.
-            dbg_line: u32,
             dbg_hint: Option<&'static str>,
         }
         impl Mem {
@@ -268,32 +391,30 @@ impl Program {
                     F192::ZERO
                 }
             }
-            // Write-once store: writing a different value to an already-set cell panics.
+            // Write-once store: writing a different value to an already-set cell fails.
             #[inline(always)]
-            fn put(&mut self, cell: u32, v: F192) {
+            fn put(&mut self, cell: u32, v: F192) -> Result<(), ExecError> {
                 self.ensure(cell as usize);
                 let c = cell as usize;
                 if self.written[c] {
-                    assert!(
-                        self.cells[c] == v,
-                        "write-once conflict at cell {cell} ({}, hint {:?}): had {:x}:{:x}:{:x}, new {:x}:{:x}:{:x}",
-                        if self.dbg_line == 0 {
-                            format!("pc {}", self.dbg_pc)
-                        } else {
-                            format!("line {}, pc {}", self.dbg_line, self.dbg_pc)
-                        },
-                        self.dbg_hint,
-                        self.cells[c].c2,
-                        self.cells[c].c1,
-                        self.cells[c].c0,
-                        v.c2,
-                        v.c1,
-                        v.c0
-                    );
+                    if self.cells[c] != v {
+                        return Err(self.conflict(cell, v));
+                    }
                 } else {
                     self.cells[c] = v;
                     self.written[c] = true;
                 }
+                Ok(())
+            }
+            #[cold]
+            fn conflict(&self, cell: u32, v: F192) -> ExecError {
+                let fault = Fault::Conflict {
+                    cell,
+                    had: self.cells[cell as usize],
+                    new: v,
+                    hint: self.dbg_hint,
+                };
+                ExecError::at(self.dbg_pc, fault)
             }
             // Read the running access count and advance it by ×g (the free increment).
             // ×g is ×x, i.e. `mul_by_g`, a shift+fold rather than a PMULL; this runs on every
@@ -311,7 +432,7 @@ impl Program {
         // with g^n = x, by baby-step giant-step (baby table g^j for j < 2^17,
         // built once per run; giant step ×g^(-2^17)). Prover-side only: the
         // guest re-verifies the hinted bits in-circuit.
-        fn bounded_dlog(cache: &mut Option<(GPow, F64)>, x: F64, nbits: u32) -> u128 {
+        fn bounded_dlog(cache: &mut Option<(GPow, F64)>, x: F64, nbits: u32) -> Option<u128> {
             const LOG_BABY: u32 = 17;
             let (baby, giant) = cache.get_or_insert_with(|| {
                 let baby = GPow::new((1usize << LOG_BABY) - 1);
@@ -327,25 +448,25 @@ impl Program {
             };
             for a in 0..max_giant {
                 if let Some(j) = baby.log(y) {
-                    return (a as u128) << LOG_BABY | j as u128;
+                    return Some((a as u128) << LOG_BABY | j as u128);
                 }
                 y *= *giant;
             }
-            panic!("hint_decompose_bits_exponent: value is not g^n for n < 2^{nbits}")
+            None
         }
 
         // The cell a heap run starts at: read the pointer back out of memory and
         // invert it. Shared by every hint that writes through one.
-        fn heap_base(m: &Mem, g: &mut GPow, cell: u32, what: &str) -> u32 {
-            let p = as_addr(m.get(cell)).unwrap_or_else(|| panic!("{what} pointer is not a K-valued g-power"));
-            g.log(p).unwrap_or_else(|| panic!("{what} pointer is not a g-power"))
+        fn heap_base(m: &Mem, g: &mut GPow, cell: u32, what: &'static str) -> Result<u32, Fault> {
+            let p = in_k(what, m.get(cell))?;
+            g.log(p).ok_or(Fault::NotAGPower { what, value: p })
         }
 
         // Where a computed-advice bit buffer starts: a frame run needs no lookup
         // at all, which is the point of having one.
-        fn bits_base(m: &Mem, g: &mut GPow, fp: u32, dest: BitsDest, what: &str) -> u32 {
+        fn bits_base(m: &Mem, g: &mut GPow, fp: u32, dest: BitsDest, what: &'static str) -> Result<u32, Fault> {
             match dest {
-                BitsDest::Stack(base) => fp + base,
+                BitsDest::Stack(base) => Ok(fp + base),
                 BitsDest::Heap(ptr) => heap_base(m, g, fp + ptr, what),
             }
         }
@@ -366,7 +487,9 @@ impl Program {
             };
             if switch {
                 if left.is_none() {
-                    assert_eq!((pc, fp), (ending_pc, 0), "main must halt at the sentinel pc g^{{B-1}}");
+                    if fp != 0 {
+                        return Err(ExecError::at(pc, Fault::HaltOutsideMain { fp }));
+                    }
                     let counts = [xor.len(), mul.len(), set.len(), deref.len(), jump.len(), blake2s.len()];
                     base_counts = Some(counts);
                     fill_base = (1usize << crate::cpu::MIN_LOG_MEM).max(next_free as usize);
@@ -386,9 +509,9 @@ impl Program {
                             // What the closing jump reads: back to the block's own first
                             // instruction, in this same frame. Then the pointer the `DEREF`
                             // dummy follows, memory cell `0`.
-                            m.put(frame + fr::DEST, F192::from(g.pow(block_pc as usize)));
-                            m.put(frame + fr::NEXT_FP, F192::from(g.pow(frame as usize)));
-                            m.put(frame + fr::PTR, F192::ONE);
+                            m.put(frame + fr::DEST, F192::from(g.pow(block_pc as usize)))?;
+                            m.put(frame + fr::NEXT_FP, F192::from(g.pow(frame as usize)))?;
+                            m.put(frame + fr::PTR, F192::ONE)?;
                             runs.push((block_pc, frame, n * (size as usize + 1)));
                             frame += fr::CELLS;
                         }
@@ -408,9 +531,11 @@ impl Program {
             if let Some(n) = &mut left {
                 *n -= 1;
             }
-            assert!(steps < 100_000_000, "step limit exceeded (runaway recursion?)");
+            if steps >= MAX_STEPS {
+                return Err(ExecError::at(pc, Fault::StepLimit));
+            }
             m.dbg_pc = pc;
-            m.dbg_line = self.src_lines.get(pc as usize).copied().unwrap_or(0);
+            let fail = move |fault| ExecError::at(pc, fault);
             if let Some(p) = prof.as_mut() {
                 p[pc as usize] += 1;
             }
@@ -436,12 +561,13 @@ impl Program {
                     });
                     match h {
                         RHint::ResolveDeref { ptr, offset, dst } => {
-                            let base = heap_base(&m, &mut g, fp + ptr, "cached DEREF");
+                            let base = heap_base(&m, &mut g, fp + ptr, "cached DEREF pointer").map_err(fail)?;
                             let src = base + offset;
                             let dst = fp + dst;
+                            m.ensure(src.max(dst) as usize);
                             match (m.written[src as usize], m.written[dst as usize]) {
-                                (true, false) => m.put(dst, m.cells[src as usize]),
-                                (false, true) => m.put(src, m.cells[dst as usize]),
+                                (true, false) => m.put(dst, m.cells[src as usize])?,
+                                (false, true) => m.put(src, m.cells[dst as usize])?,
                                 _ => {}
                             }
                         }
@@ -460,29 +586,38 @@ impl Program {
                                     end,
                                     start_inverse,
                                 } => {
-                                    let span =
-                                        as_addr(m.get(fp + end)).expect("loop bound is not in K") * start_inverse;
-                                    assert!(!span.is_zero(), "loop bound is zero");
-                                    let max_frames = ((1u64 << 28) - u64::from(next_free)) / u64::from(size);
+                                    let span = in_k("loop bound", m.get(fp + end)).map_err(fail)? * start_inverse;
+                                    if span.is_zero() {
+                                        return Err(fail(Fault::NotAGPower {
+                                            what: "loop bound",
+                                            value: span,
+                                        }));
+                                    }
+                                    let max_frames = u64::from(MAX_CELLS.saturating_sub(next_free)) / u64::from(size);
                                     let max_span = max_frames.saturating_sub(1) as usize;
                                     let mut exponent = g.log(span);
                                     while exponent.is_none() && g.covered() <= max_span {
                                         g.grow_to((2 * g.covered()).min(max_span));
                                         exponent = g.log(span);
                                     }
-                                    let n = exponent.expect("loop bound exceeds the address space") + 1;
-                                    (ptr, size.checked_mul(n).expect("loop frames overflow"))
+                                    let n = exponent.ok_or(fail(Fault::OutOfMemory))? + 1;
+                                    (ptr, size.checked_mul(n).ok_or(fail(Fault::OutOfMemory))?)
                                 }
                                 // A runtime size is carried in the exponent:
                                 // the cell holds g^k, allocate k cells (reverse
                                 // g-power lookup, growing the index if needed).
                                 RHint::AllocDyn { ptr, size } => {
-                                    let sz = as_addr(m.get(fp + size)).expect("HeapBuf size is not a K-valued g-power");
-                                    let cells = g.log(sz).unwrap_or_else(|| {
-                                        g.grow_to(1 << 20);
-                                        g.log(sz)
-                                            .unwrap_or_else(|| panic!("HeapBuf size is not a g-power below 2^20 cells"))
-                                    });
+                                    let sz = in_k("HeapBuf size", m.get(fp + size)).map_err(fail)?;
+                                    let cells = match g.log(sz) {
+                                        Some(cells) => cells,
+                                        None => {
+                                            g.grow_to(1 << 20);
+                                            g.log(sz).ok_or(fail(Fault::NotAGPower {
+                                                what: "HeapBuf size",
+                                                value: sz,
+                                            }))?
+                                        }
+                                    };
                                     (ptr, cells)
                                 }
                                 _ => unreachable!(),
@@ -491,7 +626,10 @@ impl Program {
                             m.ensure(cell as usize);
                             if !m.written[cell as usize] {
                                 let base = next_free;
-                                next_free += size;
+                                next_free = base
+                                    .checked_add(size)
+                                    .filter(|&end| end < MAX_CELLS)
+                                    .ok_or(fail(Fault::OutOfMemory))?;
                                 g.grow_to((base + size) as usize);
                                 // The base is about to become a pointer in memory.
                                 g.note(base as usize);
@@ -531,16 +669,18 @@ impl Program {
                             }
                         }
                         RHint::WitnessStack { name, base, len } => {
-                            let values = pop_witness(&self.witness, &mut witness_positions, name, *len);
+                            let values =
+                                pop_witness(&self.witness, &mut witness_positions, name, *len).map_err(fail)?;
                             for (k, &value) in values.iter().enumerate() {
-                                m.put(fp + base + k as u32, value);
+                                m.put(fp + base + k as u32, value)?;
                             }
                         }
                         RHint::WitnessHeap { name, ptr, lo, len } => {
-                            let b = heap_base(&m, &mut g, fp + ptr, "hint_witness heap");
-                            let values = pop_witness(&self.witness, &mut witness_positions, name, *len);
+                            let b = heap_base(&m, &mut g, fp + ptr, "hint_witness heap pointer").map_err(fail)?;
+                            let values =
+                                pop_witness(&self.witness, &mut witness_positions, name, *len).map_err(fail)?;
                             for (k, &value) in values.iter().enumerate() {
-                                m.put(b + lo + k as u32, value);
+                                m.put(b + lo + k as u32, value)?;
                             }
                         }
                         RHint::Log2Ceil {
@@ -549,7 +689,7 @@ impl Program {
                             nbits,
                             floor,
                         } => {
-                            let b = bits_base(&m, &mut g, fp, *bits, "log2_ceil");
+                            let b = bits_base(&m, &mut g, fp, *bits, "log2_ceil pointer").map_err(fail)?;
                             let mut word: u128 = 0;
                             for j in 0..*nbits {
                                 if !m.get(b + j).is_zero() {
@@ -562,26 +702,28 @@ impl Program {
                                 u128::BITS - (word - 1).leading_zeros()
                             };
                             let mu = cl.max(*floor);
-                            m.put(fp + dst, F192::from(primitives::field::g_pow(mu as usize)));
+                            m.put(fp + dst, F192::from(primitives::field::g_pow(mu as usize)))?;
                         }
                         RHint::BitDecompose { value, bits, nbits } => {
                             assert!(*nbits <= 192, "a machine word has 192 bits");
                             let v = m.get(fp + value);
                             let limbs = [v.c0, v.c1, v.c2];
-                            let bb = bits_base(&m, &mut g, fp, *bits, "decompose");
+                            let bb = bits_base(&m, &mut g, fp, *bits, "decompose pointer").map_err(fail)?;
                             for j in 0..*nbits {
                                 let bit = (limbs[j as usize / 64] >> (j % 64)) & 1;
-                                m.put(bb + j, F192::new(bit, 0, 0));
+                                m.put(bb + j, F192::new(bit, 0, 0))?;
                             }
                         }
                         RHint::BitDecomposeExp { value, bits, nbits } => {
-                            let x = as_addr(m.get(fp + value))
-                                .expect("hint_decompose_bits_exponent value is not a K-valued g-power");
-                            let n = bounded_dlog(&mut dlog_cache, x, *nbits);
-                            let bb = bits_base(&m, &mut g, fp, *bits, "hint_decompose_bits_exponent");
+                            const WHAT: &str = "hint_decompose_bits_exponent value";
+                            let x = in_k(WHAT, m.get(fp + value)).map_err(fail)?;
+                            let n = bounded_dlog(&mut dlog_cache, x, *nbits)
+                                .ok_or(fail(Fault::NotAGPower { what: WHAT, value: x }))?;
+                            let bb = bits_base(&m, &mut g, fp, *bits, "hint_decompose_bits_exponent pointer")
+                                .map_err(fail)?;
                             for j in 0..*nbits {
                                 let bit = ((n >> j) & 1) as u64;
-                                m.put(bb + j, F192::new(bit, 0, 0));
+                                m.put(bb + j, F192::new(bit, 0, 0))?;
                             }
                         }
                         RHint::FieldLimbs { value, base, len } => {
@@ -589,12 +731,12 @@ impl Program {
                             let v = m.get(fp + value);
                             let limbs = [v.c0, v.c1, v.c2];
                             for j in 0..*len {
-                                m.put(fp + base + j, F192::new(limbs[j as usize], 0, 0));
+                                m.put(fp + base + j, F192::new(limbs[j as usize], 0, 0))?;
                             }
                         }
                         RHint::Inverse { value, dst } => {
                             let v = m.get(fp + value);
-                            m.put(fp + dst, if v.is_zero() { F192::ZERO } else { v.inv() });
+                            m.put(fp + dst, if v.is_zero() { F192::ZERO } else { v.inv() })?;
                         }
                     }
                     m.dbg_hint = None;
@@ -638,14 +780,16 @@ impl Program {
                         let (ha, hb) = (is_set(&m.written, aa), is_set(&m.written, ab));
                         if ha ^ hb {
                             let vk = m.get(if ha { aa } else { ab });
-                            assert!(!vk.is_zero(), "cannot back-solve MUL through a zero operand");
-                            m.put(if ha { ab } else { aa }, m.get(ac) * vk.inv());
+                            if vk.is_zero() {
+                                return Err(fail(Fault::BackSolveThroughZero));
+                            }
+                            m.put(if ha { ab } else { aa }, m.get(ac) * vk.inv())?;
                         }
                     }
                     let va = m.get(aa);
                     let vb = m.get(ab);
                     let vc = if is_xor { va + vb } else { va * vb };
-                    m.put(ac, vc);
+                    m.put(ac, vc)?;
                     let ra = m.bump_access_count(aa);
                     let rb = m.bump_access_count(ab);
                     let rc = m.bump_access_count(ac);
@@ -666,7 +810,7 @@ impl Program {
                 }
                 Op::Set { o, k } => {
                     let a = fp + o;
-                    m.put(a, k);
+                    m.put(a, k)?;
                     let r = m.bump_access_count(a);
                     set.push(Srow {
                         pc,
@@ -679,14 +823,7 @@ impl Program {
                 Op::Deref { o1, o2, o3, mode } => {
                     let a1 = fp + o1;
                     let p = m.get(a1);
-                    let p_addr = as_addr(p).unwrap_or_else(|| {
-                        panic!(
-                            "DEREF pointer is not a K-valued g-power at pc {pc} (in {}): {:x}:{:x}",
-                            self.site_at(pc),
-                            p.c1,
-                            p.c0
-                        )
-                    });
+                    let p_addr = as_addr(p).ok_or(fail(Fault::WildPointer { value: p }))?;
                     let base = match g.log(p_addr) {
                         Some(b) => b,
                         None => {
@@ -697,47 +834,26 @@ impl Program {
                             // pointer: a wild deref, or a failed range check
                             // (`assert log _ < _`) surfacing honestly.
                             g.grow_to(1 << MIN_LOG_MEM);
-                            g.log(p_addr).unwrap_or_else(|| {
-                                panic!(
-                                    "DEREF pointer is not a small g-power at pc {pc} (in {}): a wild \
-                                     pointer, or a failed range check \
-                                     (value 0x{:016x})",
-                                    self.site_at(pc),
-                                    p_addr.0
-                                )
-                            })
+                            g.log(p_addr).ok_or(fail(Fault::WildPointer { value: p }))?
                         }
                     };
                     let a2 = (base + o2) as usize;
                     let a3 = fp + o3;
                     match mode {
                         DerefMode::Cell => {
-                            // Equality m[a2] == m[a3]: fill the unset side.
+                            // Equality m[a2] == m[a3]: fill the unset side, or let
+                            // `put` check it when both are set.
                             m.ensure(a2);
                             let has2 = m.written[a2];
                             let has3 = (a3 as usize) < m.written.len() && m.written[a3 as usize];
                             match (has2, has3) {
-                                (true, true) => {
-                                    assert!(
-                                        m.cells[a2] == m.get(a3),
-                                        "DEREF mismatch at pc {pc} (in {}): m[{a2}] = {:x}:{:x}:{:x} but \
-                                         m[fp+{o3}] = {:x}:{:x}:{:x}",
-                                        self.site_at(pc),
-                                        m.cells[a2].c2,
-                                        m.cells[a2].c1,
-                                        m.cells[a2].c0,
-                                        m.get(a3).c2,
-                                        m.get(a3).c1,
-                                        m.get(a3).c0,
-                                    )
-                                }
-                                (true, false) => {
+                                (true, _) => {
                                     let v = m.cells[a2];
-                                    m.put(a3, v);
+                                    m.put(a3, v)?;
                                 }
                                 (false, true) => {
                                     let v = m.get(a3);
-                                    m.put(a2 as u32, v);
+                                    m.put(a2 as u32, v)?;
                                 }
                                 (false, false) => {
                                     // Both sides still unwritten: a range-check
@@ -747,7 +863,7 @@ impl Program {
                                     // (a later program write, or ZERO) is known;
                                     // the row itself needs no patch, since the
                                     // fill reads both values out of that image.
-                                    deferred.push((a2, a3));
+                                    deferred.push((a2, a3, pc));
                                 }
                             }
                         }
@@ -756,12 +872,12 @@ impl Program {
                             // addresses, and JUMP reads them back.
                             g.note(pc as usize + 2);
                             let v = F192::from(g.pow(pc as usize + 2));
-                            m.put(a2 as u32, v);
+                            m.put(a2 as u32, v)?;
                         }
                         DerefMode::Fp => {
                             g.note(fp as usize);
                             let v = F192::from(g.pow(fp as usize));
-                            m.put(a2 as u32, v);
+                            m.put(a2 as u32, v)?;
                         }
                     }
                     let r1 = m.bump_access_count(a1);
@@ -785,9 +901,9 @@ impl Program {
                     // otherwise not balance. A guest branches on g-powers; the one
                     // idiom that once branched on a word, `assert a != b`, takes an
                     // inverse hint instead (§sec:prog-div-ne).
-                    let c = as_addr(m.get(ac)).expect("JUMP condition is not a K-valued word");
-                    let d = as_addr(m.get(ad)).expect("JUMP target is not a K-valued word");
-                    let f = as_addr(m.get(af)).expect("JUMP fp is not a K-valued word");
+                    let c = in_k("JUMP condition", m.get(ac)).map_err(fail)?;
+                    let d = in_k("JUMP target", m.get(ad)).map_err(fail)?;
+                    let f = in_k("JUMP fp", m.get(af)).map_err(fail)?;
                     // The is-nonzero witness `w = c⁻¹` is never used for control
                     // flow, only recorded as a witness column, so it is not
                     // computed here at all: `JumpTable::fill` batch-inverts every
@@ -805,8 +921,17 @@ impl Program {
                         bytecode_read,
                     });
                     if taken {
-                        pc = g.log(d).expect("JUMP target not a g-power");
-                        fp = g.log(f).expect("JUMP fp not a g-power");
+                        pc = g
+                            .log(d)
+                            .filter(|&t| (t as usize) < self.prog.len())
+                            .ok_or(fail(Fault::NotAGPower {
+                                what: "JUMP target",
+                                value: d,
+                            }))?;
+                        fp = g.log(f).ok_or(fail(Fault::NotAGPower {
+                            what: "JUMP fp",
+                            value: f,
+                        }))?;
                     } else {
                         pc += 1;
                     }
@@ -822,15 +947,12 @@ impl Program {
                     let words = [aa0, aa1, ab0, ab1, acv, acv + 1, amd].map(|a| m.get(a));
                     // Naming the operand and the line matters most for the metadata,
                     // the one a guest builds with field arithmetic rather than reads.
-                    if let Some((i, w)) = words.iter().enumerate().find(|(_, w)| w.c2 != 0) {
+                    if let Some((i, &value)) = words.iter().enumerate().find(|(_, w)| w.c2 != 0) {
                         const CELLS: [&str; 7] = ["m0", "m1", "m2", "m3", "cv0", "cv1", "md"];
-                        panic!(
-                            "BLAKE2s {} cell is not a canonical 128-bit embedding at pc {pc} (in {}): \
-                             top limb 0x{:016x}",
-                            CELLS[i],
-                            self.site_at(pc),
-                            w.c2
-                        );
+                        return Err(fail(Fault::NotCanonical {
+                            operand: CELLS[i],
+                            value,
+                        }));
                     }
                     let va = [F64(words[0].c0), F64(words[0].c1), F64(words[1].c0), F64(words[1].c1)];
                     let vb = [F64(words[2].c0), F64(words[2].c1), F64(words[3].c0), F64(words[3].c1)];
@@ -843,8 +965,8 @@ impl Program {
                     // cells are consistent for any later read.
                     let vc = blake2s_compress(va, vb, vcv, metadata);
                     let outputs = [F192::new(vc[0].0, vc[1].0, 0), F192::new(vc[2].0, vc[3].0, 0)];
-                    m.put(ac, outputs[0]);
-                    m.put(ac + 1, outputs[1]);
+                    m.put(ac, outputs[0])?;
+                    m.put(ac + 1, outputs[1])?;
                     let ra = [m.bump_access_count(aa0), m.bump_access_count(aa1)];
                     let rb = [m.bump_access_count(ab0), m.bump_access_count(ab1)];
                     let rcv = [m.bump_access_count(acv), m.bump_access_count(acv + 1)];
@@ -916,23 +1038,27 @@ impl Program {
         // sides out of the finished image, and their access counts were already
         // bumped during the walk (the memory bus is order-independent, it only
         // needs every access to agree on the value).
-        while {
+        loop {
             let before = deferred.len();
-            deferred.retain(|&(a2, a3)| {
+            let mut waiting = Vec::with_capacity(before);
+            for (a2, a3, at) in deferred {
                 if m.written[a2] {
-                    let v = m.cells[a2];
-                    m.put(a3, v);
-                    false
+                    m.dbg_pc = at;
+                    m.put(a3, m.cells[a2])?;
                 } else {
-                    true
+                    waiting.push((a2, a3, at));
                 }
-            });
-            deferred.len() < before
-        } {}
-        for (a2, a3) in deferred {
+            }
+            deferred = waiting;
+            if deferred.len() == before {
+                break;
+            }
+        }
+        for (a2, a3, at) in deferred {
             // Never written: the cells are genuinely unconstrained; fix them to ZERO.
-            m.put(a2 as u32, F192::ZERO);
-            m.put(a3, F192::ZERO);
+            m.dbg_pc = at;
+            m.put(a2 as u32, F192::ZERO)?;
+            m.put(a3, F192::ZERO)?;
         }
 
         // Cells an instruction touched that nothing ever wrote. Read off the two
@@ -963,7 +1089,7 @@ impl Program {
             mem_count: m.count,
             bytecode_count,
         };
-        Execution {
+        Ok(Execution {
             mem: m.cells,
             cycles: steps,
             mem_used,
@@ -972,6 +1098,6 @@ impl Program {
             base_counts: base_counts.expect("the run halted, so its own counts were taken"),
             unconstrained_reads,
             trace,
-        }
+        })
     }
 }

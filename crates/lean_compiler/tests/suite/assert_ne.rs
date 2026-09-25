@@ -54,12 +54,9 @@ def main():
     let run = |a: F64, b: F64| -> bool {
         let mut program = compile(&parse(src).expect("parse"));
         program.set_witness("vals", vec![vec![F192::from(a), F192::from(b)]]);
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let pi = [F192::from(a), F192::from(b)];
-            let (proof, _) = prove(&program, pi, lean_vm::pcs::TEST_LOG_INV_RATE).unwrap();
-            verify(&program, &pi, &proof).is_ok()
-        }))
-        .unwrap_or(false)
+        let pi = [F192::from(a), F192::from(b)];
+        prove(&program, pi, lean_vm::pcs::TEST_LOG_INV_RATE)
+            .is_ok_and(|(proof, _)| verify(&program, &pi, &proof).is_ok())
     };
     assert!(run(g_pow(3), g_pow(5)), "distinct hints must verify");
     assert!(!run(g_pow(3), g_pow(3)), "equal hints must be rejected by `assert !=`");
@@ -161,12 +158,9 @@ def main():
     let run = |a: F64, b: F64| -> bool {
         let mut program = compile(&parse(src).expect("parse"));
         program.set_witness("vals", vec![vec![F192::from(a), F192::from(b)]]);
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let pi = [F192::from(a) + F192::from(b), F192::ONE];
-            let (proof, _) = prove(&program, pi, lean_vm::pcs::TEST_LOG_INV_RATE).unwrap();
-            verify(&program, &pi, &proof).is_ok()
-        }))
-        .unwrap_or(false)
+        let pi = [F192::from(a) + F192::from(b), F192::ONE];
+        prove(&program, pi, lean_vm::pcs::TEST_LOG_INV_RATE)
+            .is_ok_and(|(proof, _)| verify(&program, &pi, &proof).is_ok())
     };
     assert!(run(g_pow(3), g_pow(5)), "distinct hints must verify");
     assert!(
@@ -195,11 +189,8 @@ def main():
     let run = |a: F192, b: F192, inv: F192| -> bool {
         let mut program = compile(&parse(src).expect("parse"));
         program.set_witness("vals", vec![vec![a, b, inv]]);
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let (proof, _) = prove(&program, [a, b], lean_vm::pcs::TEST_LOG_INV_RATE).unwrap();
-            verify(&program, &[a, b], &proof).is_ok()
-        }))
-        .unwrap_or(false)
+        prove(&program, [a, b], lean_vm::pcs::TEST_LOG_INV_RATE)
+            .is_ok_and(|(proof, _)| verify(&program, &[a, b], &proof).is_ok())
     };
     let (a, b) = (F192::from(g_pow(3)), F192::from(g_pow(5)));
     let d = a + b;

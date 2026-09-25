@@ -7,6 +7,9 @@ use primitives::field::F64;
 /// Frame-relative offset operand (matches the compiler's `ir::Off`).
 pub type Off = u32;
 
+/// Cells a program can address: [`GPow`] covers no more.
+pub(crate) const MAX_CELLS: u32 = 1 << 28;
+
 /// The `g^k` table paired with a reverse index `g^k ↦ k`, both grown on demand
 /// (recursion depth, and so the address range, is unbounded).
 ///
@@ -74,7 +77,7 @@ impl GPow {
 
     /// Extend the forward table to cover index `upto`.
     pub fn grow_to(&mut self, upto: usize) {
-        assert!(upto < (1 << 28), "address space overflow (program too large)");
+        assert!(upto < MAX_CELLS as usize, "address space overflow (program too large)");
         while self.pow.len() <= upto {
             // ×g is ×x = `mul_by_g` (shift+fold), not a PMULL.
             let next = primitives::field::mul_by_g(*self.pow.last().unwrap());

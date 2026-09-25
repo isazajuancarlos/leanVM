@@ -310,7 +310,7 @@ def main():
 ";
     let mut p = super::build(src);
     p.set_witness("msg", vec![vec![k(5), k(7), F192::ZERO, F192::ZERO]]);
-    p.execute([F192::ZERO, F192::ZERO]);
+    p.execute([F192::ZERO, F192::ZERO]).unwrap();
 }
 
 /// The fused `match` path must reject a call that binds more names than

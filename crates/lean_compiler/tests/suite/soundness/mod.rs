@@ -138,8 +138,8 @@ pub enum Ran {
     /// It completed. Carries the cells it read that nothing ever wrote, which
     /// must be empty for the program to mean what its source says.
     Ok { unconstrained: Vec<u32> },
-    /// It aborted: a write-once conflict (which is how every `assert` fails), a
-    /// wild dereference, or any other interpreter panic.
+    /// It failed: a write-once conflict (which is how every `assert` fails), a
+    /// wild dereference, or any other [`lean_vm::cpu::Fault`].
     Rejected,
 }
 
@@ -166,7 +166,7 @@ pub fn run(program: &Program, t: &Trial) -> Ran {
         p.set_witness(*name, entries.clone());
     }
     let pi = t.pi;
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.execute(pi))) {
+    match p.execute(pi) {
         Ok(exec) => Ran::Ok {
             unconstrained: exec.unconstrained_reads,
         },

@@ -11,6 +11,7 @@ use primitives::field::F192;
 pub fn mix(src: &str, pi: [F192; 2]) -> [usize; lean_vm::cpu::Stats::TABLES.len()] {
     compile_without_filler(&parse(src).expect("parse"))
         .execute(pi)
+        .unwrap()
         .base_counts
 }
 
